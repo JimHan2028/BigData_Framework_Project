@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  给 Hive 容器专用的 HBase 客户端配置
+  挂载路径：/opt/hive/conf/hbase-site.xml（hive-server 与 hive-init 共用）
+
+  为什么需要它：
+    Hive-on-HBase 靠 HBaseStorageHandler 访问 HBase，而 HBase 客户端
+    只从 classpath 上的 hbase-site.xml 读集群地址。容器里默认没有这份配置，
+    客户端会退回 localhost:2181，但 Hive 容器自身没有 zookeeper，
+    于是建表报 Can't get connection to ZooKeeper，或建表成功但 select 卡死。
+
+  重要：XML 注释里不允许出现连续两个减号，否则整个文件解析失败，
+        HBaseConfiguration 会抛 SAXParseException，建映射表直接报错。
+        本文件因此不使用减号分隔线，改动时请保持这一点。
+-->
+<configuration>
+
+  <!-- Zookeeper 地址：compose 中的服务名，容器网络内可直接解析 -->
+  <property>
+    <name>hbase.zookeeper.quorum</name>
+    <value>hbase</value>
+  </property>
+
+  <!-- Zookeeper 客户端端口，HBase 默认 2181 -->
+  <property>
+    <name>hbase.zookeeper.property.clientPort</name>
+    <value>2181</value>
+  </property>
+
+  <!-- HBase 在 Zookeeper 里的根节点，须与 HBase 集群一致 -->
+  <property>
+    <name>zookeeper.znode.parent</name>
+    <value>/hbase</value>
+  </property>
+
+  <!-- 客户端重试次数：实验环境给 3 次，避免连不上时长时间卡死 -->
+  <property>
+    <name>hbase.client.retries.number</name>
+    <value>3</value>
+  </property>
+
+  <!-- RPC 超时（毫秒）：容器首次启动较慢，给足 60 秒 -->
+  <property>
+    <name>hbase.rpc.timeout</name>
+    <value>60000</value>
+  </property>
+
+  <!-- 扫描缓存行数：Hive 全表扫描时适当加大，减少 RPC 次数 -->
+  <property>
+    <name>hbase.client.scanner.caching</name>
+    <value>100</value>
+  </property>
+
+</configuration>

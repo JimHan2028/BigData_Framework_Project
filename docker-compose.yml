@@ -1,0 +1,627 @@
+services:
+  # ---------- 1. Zookeeper ----------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:${CP_VERSION}
+    container_name: zookeeper
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS}
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc -w 3 localhost 2181 | grep -q 'Mode: standalone'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------- 2. Kafka ----------
+  kafka:
+    image: confluentinc/cp-kafka:${CP_VERSION}
+    container_name: kafka
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # ---- 生产化参数：分区 / 副本 / 压缩 / 保留 ----
+      KAFKA_NUM_PARTITIONS: ${KAFKA_NUM_PARTITIONS}
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_COMPRESSION_TYPE: ${KAFKA_COMPRESSION_TYPE}
+      KAFKA_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS}
+      KAFKA_LOG_SEGMENT_BYTES: ${KAFKA_LOG_SEGMENT_BYTES}
+      KAFKA_LOG_CLEANUP_POLICY: delete
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS}
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+
+  # ---------- 3. Elasticsearch ----------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_VERSION}
+    container_name: elasticsearch
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1400M
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=${ES_JAVA_OPTS}
+      - bootstrap.memory_lock=true
+      - TZ=${TZ}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  # ---------- 4. Kibana ----------
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${ES_VERSION}
+    container_name: kibana
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 900M
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      I18N_LOCALE: zh-CN
+      TZ: ${TZ}
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+    
+  # ---------- 5. Logstash（自建镜像）----------
+  logstash:
+    build:
+      context: ./logstash/build
+    container_name: logstash
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 900M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    environment:
+      LS_JAVA_OPTS: "${LS_JAVA_OPTS} -Duser.timezone=Asia/Shanghai"
+      TZ: ${TZ}
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline
+      - ./logstash/template:/usr/share/logstash/template:ro
+      # pipelines.yml 把 es.conf / hdfs.conf 拆成两条独立管线，
+      # 否则两个 kafka input 会各消费一遍全量数据，且 filter 互相污染
+      - ./logstash/config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+    ports:
+      - "9600:9600"
+
+  # ---------- 6. HDFS：NameNode ----------
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop${HADOOP_VERSION}-java8
+    container_name: namenode
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 640M
+    environment:
+      CLUSTER_NAME: bigdata
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      HDFS_CONF_dfs_replication: 1
+      HDFS_CONF_dfs_permissions_enabled: "false"
+      HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
+      HADOOP_HEAPSIZE: ${HADOOP_HEAPSIZE}
+      TZ: ${TZ}
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9870 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  # ---------- 7. HDFS：DataNode ----------
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop${HADOOP_VERSION}-java8
+    container_name: datanode
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 640M
+    depends_on:
+      namenode:
+        condition: service_healthy
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      HDFS_CONF_dfs_replication: 1
+      HDFS_CONF_dfs_permissions_enabled: "false"
+      HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check: "false"
+      SERVICE_PRECONDITION: "namenode:9870"
+      HADOOP_HEAPSIZE: ${HADOOP_HEAPSIZE}
+      TZ: ${TZ}
+    volumes:
+      - datanode_data:/hadoop/dfs/data
+
+  # ---------- 8. Hive 元数据库 ----------
+  hive-metastore-postgresql:
+    image: bde2020/hive-metastore-postgresql:2.3.0
+    container_name: hive-metastore-postgresql
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    environment:
+      TZ: ${TZ}
+
+  # ---------- 9. HiveServer2 ----------
+  hive-server:
+    image: bde2020/hive:2.3.1-postgresql-metastore
+    container_name: hive-server
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 900M
+    depends_on:
+      namenode:
+        condition: service_healthy
+      hive-metastore-postgresql:
+        condition: service_started
+    environment:
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionURL: "jdbc:postgresql://hive-metastore-postgresql/metastore"
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionDriverName: "org.postgresql.Driver"
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionUserName: "hive"
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionPassword: "hive"
+      CORE_CONF_fs_defaultFS: "hdfs://namenode:9000"
+      SERVICE_PRECONDITION: "namenode:9870 hive-metastore-postgresql:5432"
+      # ---- Hive 执行调优：动态分区 + Map 端 Join + 并行执行 ----
+      HIVE_SITE_CONF_hive_exec_dynamic_partition: "true"
+      HIVE_SITE_CONF_hive_exec_dynamic_partition_mode: "nonstrict"
+      HIVE_SITE_CONF_hive_auto_convert_join: "true"
+      HIVE_SITE_CONF_hive_auto_convert_join_noconditionaltask: "true"
+      HIVE_SITE_CONF_hive_exec_parallel: "true"
+      HIVE_SITE_CONF_hive_exec_parallel_thread_number: "4"
+      HIVE_SITE_CONF_hive_exec_compress_intermediate: "true"
+      HIVE_SITE_CONF_hive_exec_reducers_max: "2"
+      HIVE_HEAPSIZE: ${HIVE_HEAPSIZE}
+      TZ: ${TZ}
+    ports:
+      - "10000:10000"
+      - "10002:10002"
+    volumes:
+      - ./hive/init:/hive/init
+      # ---- 关键修复：把 HBase 客户端配置注入 Hive ----
+      # Hive-on-HBase 靠 HBaseStorageHandler 访问 HBase，它读的是 classpath 上的 hbase-site.xml。
+      # 不挂这个文件，Hive 会拿默认的 localhost:2181 去找 zookeeper，
+      # 而容器里 2181 是 zookeeper 服务、不是本机，于是建表/查询报
+      # "Can't get connection to ZooKeeper" 或直接超时。
+      # 挂进来后 HBase 集群地址被固定为 hbase:2181，与 hbase-sink 写入的是同一个集群。
+      - ./hive/conf/hbase-site.xml:/opt/hive/conf/hbase-site.xml:ro
+
+  # ---------- 10. HBase ----------
+  hbase:
+    image: bde2020/hbase-standalone:1.0.0-hbase1.2.6
+    container_name: hbase
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1600M
+    # start-hbase.sh 只起 master + regionserver，不起 Thrift；
+    # 而 hbase-sink（happybase）连的是 9090，这里必须自己把 thrift 拉起来，
+    # 否则 9090 永远没人监听，日志刷 Could not connect to ('hbase', 9090)。
+    # sleep 20 是等 master 就绪，thrift 起太快会连不上 ZK 自杀。
+    # 启动逻辑见 hbase/init/start-with-thrift.sh。
+    # 这里必须用两个「不含空格」的独立参数：镜像 entrypoint 是 exec $@（未加引号），
+    # 会把带空格的参数二次分词，导致 bash -c 只拿到第一段就跑完退出（exit 0 无限重启）。
+    command: ["/bin/bash", "/hbase-init/start-with-thrift.sh"]
+    environment:
+      HBASE_CONF_hbase_rootdir: file:///hbase/data #元数据保存本地
+      TZ: ${TZ}
+    ports:
+      - "16010:16010"
+      - "9090:9090"
+      - "16020:16020"
+    volumes:
+      # rootdir 落在 named volume 上，容器重建后表和数据不丢
+      - hbase_data:/hbase
+      # 建表脚本挂进来备用：hbase-sink 启动时会自动建表，
+      # 这里额外提供脚本，方便在 HBase shell 里手工验证 / 排错。
+      - ./hbase/init:/hbase-init:ro
+    healthcheck:
+      # 除了 hbase shell 能跑，还要求 9090 真的在监听，
+      # 这样 hbase-sink 的 depends_on: service_healthy 才等到 thrift 可用
+      test: ["CMD-SHELL", "echo 'list' | hbase shell -n >/dev/null 2>&1 && nc -z localhost 9090 || exit 1"]
+      interval: 20s
+      timeout: 45s
+      retries: 20
+
+
+  # ---------- 11. 订单生产者（原方案缺失，导致 up 之后 Kafka 里没有数据）----------
+  orders-gen:
+    build:
+      context: ./orders-gen
+    container_name: orders-gen
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      MAX_ORDERS: "60000"
+      TZ: ${TZ}
+
+  # ---------- 12. HBase 写入服务（链路 C 第一段：Kafka -> HBase）----------
+  hbase-sink:
+    build:
+      context: ./hbase-sink
+    container_name: hbase-sink
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    depends_on:
+      kafka:
+        condition: service_healthy
+      hbase:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+
+  # ---------- 13. Hive 建表初始化（一次性任务，跑完即退出，restart: "no"）----------
+  # 原方案要求手工进容器粘贴 SQL 建表，一步漏掉后面三张图就都查不到数据。
+  # 这里做成一次性服务：等 HiveServer2 能连上之后，自动执行 hive/init 下的两个建表脚本。
+  # 两个脚本都是 IF NOT EXISTS 写法，反复 up 重复执行也不报错、不动已有数据。
+  hive-init:
+    image: bde2020/hive:2.3.1-postgresql-metastore
+    container_name: hive-init
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    depends_on:
+      hive-server:
+        condition: service_started
+    environment:
+      CORE_CONF_fs_defaultFS: "hdfs://namenode:9000"
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionURL: "jdbc:postgresql://hive-metastore-postgresql/metastore"
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionDriverName: "org.postgresql.Driver"
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionUserName: "hive"
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionPassword: "hive"
+      TZ: ${TZ}
+    volumes:
+      - ./hive/init:/hive/init:ro
+      # 与 hive-server 挂同一份 hbase-site.xml，保证建映射表时能连上 hbase:2181
+      - ./hive/conf/hbase-site.xml:/opt/hive/conf/hbase-site.xml:ro
+    entrypoint: ["/bin/bash", "/hive/init/init.sh"]
+
+    
+  # ---------- Kafka-UI（profile: ext）----------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.6.2
+    container_name: kafka-ui
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    profiles: ["ext"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    ports:
+      - "8080:8080"
+
+  # ---------- Redis（profile: ext）----------
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+    profiles: ["ext"]
+    command: ["redis-server", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+
+  # ---------- Flink（profile: flink）----------
+  flink-jobmanager:
+    image: flink:1.17.2-scala_2.12-java11
+    container_name: flink-jobmanager
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 900M
+    profiles: ["flink"]
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.memory.process.size: 700m
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 1
+    ports:
+      - "8081:8081"
+    volumes:
+      # 作业代码与构建产物目录（flink-build 编译出的 jar 放这里）
+      - ./flink:/opt/flink-apps
+      # Kafka 连接器：flink run 提交的作业在集群侧也需要这些类，故挂进 /opt/flink/lib
+      - ./flink/lib/flink-connector-kafka-1.17.2.jar:/opt/flink/lib/flink-connector-kafka-1.17.2.jar
+      - ./flink/lib/flink-connector-base-1.17.2.jar:/opt/flink/lib/flink-connector-base-1.17.2.jar
+      - ./flink/lib/kafka-clients-3.2.3.jar:/opt/flink/lib/kafka-clients-3.2.3.jar
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  flink-taskmanager:
+    image: flink:1.17.2-scala_2.12-java11
+    container_name: flink-taskmanager
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1200M
+    profiles: ["flink"]
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.memory.process.size: 1000m
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 1
+    volumes:
+      # TaskManager 执行算子时同样要加载 Kafka 连接器
+      - ./flink/lib/flink-connector-kafka-1.17.2.jar:/opt/flink/lib/flink-connector-kafka-1.17.2.jar
+      - ./flink/lib/flink-connector-base-1.17.2.jar:/opt/flink/lib/flink-connector-base-1.17.2.jar
+      - ./flink/lib/kafka-clients-3.2.3.jar:/opt/flink/lib/kafka-clients-3.2.3.jar
+
+  # 一次性：把预编译好的作业 jar 提交到 JobManager（session 集群）
+  # 作业源码在 ./flink/src，jar 用 ./flink/build.sh 重新编译（不需每次 up 都编译）
+  flink-submit:
+    image: flink:1.17.2-scala_2.12-java11
+    container_name: flink-submit
+    profiles: ["flink"]
+    restart: "no"
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    volumes:
+      - ./flink:/opt/flink-apps
+      # 客户端提交时也要能解析作业里的 Kafka 连接器类，故与 JobManager 保持同样的 lib 挂载
+      - ./flink/lib/flink-connector-kafka-1.17.2.jar:/opt/flink/lib/flink-connector-kafka-1.17.2.jar
+      - ./flink/lib/flink-connector-base-1.17.2.jar:/opt/flink/lib/flink-connector-base-1.17.2.jar
+      - ./flink/lib/kafka-clients-3.2.3.jar:/opt/flink/lib/kafka-clients-3.2.3.jar
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        JAR=/opt/flink-apps/flink-orders-job.jar
+        if [ ! -f "$$JAR" ]; then
+          echo "[flink-submit] 未找到作业 jar，请先在宿主机执行 ./flink/build.sh 编译"; exit 1
+        fi
+        echo "[flink-submit] 提交作业到 flink-jobmanager:8081 ..."
+        /opt/flink/bin/flink run -d -m flink-jobmanager:8081 \
+          -c com.demo.OrderRealtimeJob "$$JAR"
+        echo "[flink-submit] 提交完成，作业运行状态见 http://localhost:8081"
+
+  # ---------- Spark（profile: spark）----------
+  spark:
+    # Bitnami 公共镜像仓库已下线，改用 Apache 官方镜像（自带 pyspark 3.5.1 + hadoop 3.3.4 客户端）
+    image: apache/spark:3.5.1
+    container_name: spark
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 1200M
+    profiles: ["spark"]
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - TZ=${TZ}
+    command: ["/opt/spark/sbin/start-master.sh", "--host", "spark"]
+    ports:
+      # 4040 是 Spark 应用 UI（driver）端口，Master 进程不监听它，
+      # 因此该端口由 spark-batch 映射（见下方服务），此处不再占用。
+      - "8082:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark:/opt/spark-apps
+
+  # 一次性：Spark 本地模式跑离线批分析（读 HDFS /data/orders，写 /data/spark）
+  spark-batch:
+    image: apache/spark:3.5.1
+    container_name: spark-batch
+    profiles: ["spark"]
+    restart: "no"
+    user: root
+    depends_on:
+      namenode:
+        condition: service_healthy
+    environment:
+      # 以 root 身份访问 HDFS（bde2020 的 HDFS 权限已关，但客户端身份仍需对齐）
+      - HADOOP_USER_NAME=root
+      - TZ=${TZ}
+      # Spark UI 在作业结束后立即消失，设成 120 可在跑完后多留 2 分钟供截图；
+      # 默认 0 表示作业一结束就关（正常批处理行为）。
+      - SPARK_UI_HOLD_SECONDS=${SPARK_UI_HOLD_SECONDS:-0}
+    ports:
+      # 应用 UI 只有作业运行期间存在，宿主机 4040 必须由本容器映射
+      - "4040:4040"
+    volumes:
+      - ./spark:/opt/spark-apps
+    entrypoint: ["/opt/spark/bin/spark-submit"]
+    command:
+      - "--master"
+      - "local[2]"
+      - "--conf"
+      - "spark.hadoop.fs.defaultFS=hdfs://namenode:9000"
+      - "--conf"
+      - "spark.sql.shuffle.partitions=4"
+      - "/opt/spark-apps/orders_batch_analysis.py"
+
+volumes:
+  namenode_data:
+  datanode_data:
+  # HBase 数据卷：hbase 容器的 rootdir（file:///hbase/data）挂在这里，
+  # 让表结构和订单数据在容器重建后依然存在。
+  # 注意：docker compose down -v 会把这个卷一起删掉，日常只用 stop / start。
+  hbase_data:

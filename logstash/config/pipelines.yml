@@ -1,0 +1,7 @@
+# 把两条管线拆开，各自独立：
+# 合并成一个 pipeline 会让两个 kafka input 各消费一遍全量数据，
+# 且 es 管线里的 remove_field 会污染 hdfs 管线的字段。
+- pipeline.id: es
+  path.config: "/usr/share/logstash/pipeline/es.conf"
+- pipeline.id: hdfs
+  path.config: "/usr/share/logstash/pipeline/hdfs.conf"

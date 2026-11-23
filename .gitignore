@@ -1,0 +1,35 @@
+# ===== 本地环境与密钥 =====
+.env
+*.env.local
+
+# ===== 构建产物 =====
+flink/build/
+target/
+*.class
+*.jar.tmp
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ===== 日志 =====
+*.log
+logs/
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# ===== 运行期数据与临时文件 =====
+data/
+tmp/
+temp/
+*.pid
